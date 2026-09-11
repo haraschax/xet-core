@@ -38,7 +38,6 @@ jobs:
           toolchain: 1.95.0
       - uses: ./.github/actions/cache-rust-build
       - run: cargo test --locked -p git_xet --features simulation --lib
-      - run: cargo build --locked --release -p git_xet
       - name: Package native binary and wheel
         shell: bash
         run: |
@@ -51,8 +50,7 @@ jobs:
           if [ "${{ runner.os }}" = Windows ]; then binary=git-xet.exe; fi
           cp "target/release/$binary" dist/
           cp LICENSE dist/
-          tar -czf "git-xet-${{ matrix.platform }}.tar.gz" -C dist "$binary" LICENSE
-          mv "git-xet-${{ matrix.platform }}.tar.gz" dist/
+          tar -czf "dist/git-xet-${{ matrix.platform }}.tar.gz" -C dist "$binary" LICENSE
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: git-xet-${{ matrix.platform }}

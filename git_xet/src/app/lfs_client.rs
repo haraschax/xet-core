@@ -6,11 +6,12 @@ use std::sync::Arc;
 
 use http::{HeaderMap, StatusCode};
 use reqwest::Url;
-use reqwest_middleware::ClientWithMiddleware;
+use reqwest_middleware::{ClientWithMiddleware, RequestBuilder};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use xet_client::cas_client::auth::DirectRefreshRouteTokenRefresher;
+use xet_client::cas_client::retry_wrapper::RetryWrapper;
 use xet_client::common::http_client::build_http_client;
 use xet_client::hub_client::{CasJWTInfo, CredentialHelper, Operation};
 use xet_pkg::legacy::XetFileInfo;
@@ -96,43 +97,51 @@ impl LfsClient {
             "transfers": if matches!(operation, Operation::Upload) { vec!["xet"] } else { vec!["basic"] },
             "objects": [{"oid": req.oid, "size": req.size}],
         });
-        // Try public access first. Only invoke Git's credential helper when the server requests it.
+        let request = self
+            .client
+            .post(format!("{}/objects/batch", self.endpoint.trim_end_matches('/')))
+            .header(http::header::ACCEPT, "application/vnd.git-lfs+json")
+            .header(http::header::CONTENT_TYPE, "application/vnd.git-lfs+json")
+            .body(body.to_string());
+        let batch: BatchResponse = self.request(request, operation).await?;
+        if matches!(operation, Operation::Download) && !matches!(batch.transfer.as_deref(), None | Some("basic")) {
+            return Err(GitXetError::not_supported("Unexpected LFS download transfer type"));
+        }
+        let mut object = batch
+            .objects
+            .into_iter()
+            .find(|o| o.oid == req.oid)
+            .ok_or_else(|| GitXetError::internal("LFS response omitted the requested object"))?;
+        if object.error.is_some() || object.size != req.size {
+            return Err(GitXetError::internal("LFS object unavailable or size mismatch"));
+        }
+        let action = object.actions.remove(operation.as_str());
+        if action.is_some() && matches!(operation, Operation::Upload) && batch.transfer.as_deref() != Some("xet") {
+            return Err(GitXetError::not_supported("Server did not select Xet uploads"));
+        }
+        Ok(action)
+    }
+
+    async fn request<T: serde::de::DeserializeOwned>(
+        &mut self,
+        request: RequestBuilder,
+        operation: Operation,
+    ) -> Result<T> {
+        // Public requests must not prompt. Share challenge handling and transient retries across metadata APIs.
         for attempt in 0..2 {
-            let mut request = self
-                .client
-                .post(format!("{}/objects/batch", self.endpoint.trim_end_matches('/')))
-                .header(http::header::ACCEPT, "application/vnd.git-lfs+json")
-                .header(http::header::CONTENT_TYPE, "application/vnd.git-lfs+json")
-                .body(body.to_string());
+            let mut request = request.try_clone().expect("metadata request has a buffered body");
             if let Some(credential) = &self.credential {
                 request = credential.fill_credential(request).await.map_err(GitXetError::internal)?;
             }
-            let response = request
-                .send()
-                .await
-                .map_err(|_| GitXetError::internal("LFS batch request failed"))?;
-            if response.status() == StatusCode::UNAUTHORIZED && attempt == 0 {
-                self.credential = Some(get_credential(&self.repo, &self.remote, operation)?);
-                continue;
+            let result = RetryWrapper::new(self.ctx.clone(), "lfs-metadata")
+                .run_and_extract_json(move || request.try_clone().unwrap().send())
+                .await;
+            match result {
+                Err(error) if error.status() == Some(StatusCode::UNAUTHORIZED) && attempt == 0 => {
+                    self.credential = Some(get_credential(&self.repo, &self.remote, operation)?);
+                },
+                result => return result.map_err(|_| GitXetError::internal("LFS metadata request failed")),
             }
-            let response = response.error_for_status().map_err(http_error)?;
-            let batch: BatchResponse = response.json().await.map_err(http_error)?;
-            if matches!(operation, Operation::Download) && !matches!(batch.transfer.as_deref(), None | Some("basic")) {
-                return Err(GitXetError::not_supported("Unexpected LFS download transfer type"));
-            }
-            let mut object = batch
-                .objects
-                .into_iter()
-                .find(|o| o.oid == req.oid)
-                .ok_or_else(|| GitXetError::internal("LFS response omitted the requested object"))?;
-            if object.error.is_some() || object.size != req.size {
-                return Err(GitXetError::internal("LFS object unavailable or size mismatch"));
-            }
-            let action = object.actions.remove(operation.as_str());
-            if action.is_some() && matches!(operation, Operation::Upload) && batch.transfer.as_deref() != Some("xet") {
-                return Err(GitXetError::not_supported("Server did not select Xet uploads"));
-            }
-            return Ok(action);
         }
         unreachable!()
     }
@@ -146,24 +155,8 @@ impl LfsClient {
                 info.repo_type,
                 info.full_name
             );
-            for attempt in 0..2 {
-                let refresher = Arc::new(DirectRefreshRouteTokenRefresher::new(
-                    self.ctx.clone(),
-                    &route,
-                    self.client.clone(),
-                    self.credential.clone(),
-                ));
-                match refresher.get_cas_jwt().await {
-                    Ok(token) => {
-                        self.token = Some((refresher, token));
-                        break;
-                    },
-                    Err(error) if error.status() == Some(StatusCode::UNAUTHORIZED) && attempt == 0 => {
-                        self.credential = Some(get_credential(&self.repo, &self.remote, Operation::Download)?);
-                    },
-                    Err(error) => return Err(error.into()),
-                }
-            }
+            let token = self.request(self.client.get(&route), Operation::Download).await?;
+            self.token = Some((self.token_refresher(&route), token));
         }
         Ok(self.token.as_ref().unwrap())
     }

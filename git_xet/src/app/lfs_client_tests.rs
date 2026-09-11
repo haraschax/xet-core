@@ -1,6 +1,5 @@
 use std::sync::Mutex;
 
-use axum::extract::State;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use tempfile::TempDir;
@@ -20,11 +19,12 @@ fn request() -> TransferRequest {
     }
 }
 
-fn repository() -> (TempDir, GitRepo) {
+fn client(endpoint: &str) -> (TempDir, LfsClient) {
     let dir = TempDir::new().unwrap();
     git2::Repository::init(dir.path()).unwrap();
     let repo = GitRepo::open(dir.path()).unwrap();
-    (dir, repo)
+    let remote = format!("{endpoint}/user/repo.git").parse().unwrap();
+    (dir, LfsClient::new(&XetContext::default().unwrap(), repo, remote, None).unwrap())
 }
 
 async fn serve(router: Router) -> (String, tokio::task::JoinHandle<()>) {
@@ -61,9 +61,7 @@ async fn basic_download_preserves_action_headers_and_verifies_content() {
         }),
     );
     let (endpoint, server) = serve(app).await;
-    let (_dir, repo) = repository();
-    let ctx = XetContext::default().unwrap();
-    let mut client = LfsClient::new(&ctx, repo, format!("{endpoint}/user/repo.git").parse().unwrap(), None).unwrap();
+    let (_dir, mut client) = client(&endpoint);
     let mut req = request();
     req.action = GitBatchApiResponseAction {
         href: format!("{endpoint}/file?signature=secret"),
@@ -100,14 +98,7 @@ async fn batch_checks_objects_and_skips_existing_uploads() {
         }),
     );
     let (endpoint, server) = serve(app).await;
-    let (_dir, repo) = repository();
-    let mut client = LfsClient::new(
-        &XetContext::default().unwrap(),
-        repo,
-        format!("{endpoint}/user/repo.git").parse().unwrap(),
-        None,
-    )
-    .unwrap();
+    let (_dir, mut client) = client(&endpoint);
     assert!(client.batch(&request(), Operation::Upload).await.unwrap().is_none());
     let file = tempfile::NamedTempFile::new().unwrap();
     let progress = ProgressUpdater::new(Arc::new(Mutex::new(Vec::new())), &request().oid);
@@ -123,76 +114,37 @@ async fn batch_checks_objects_and_skips_existing_uploads() {
 }
 
 #[cfg(feature = "simulation")]
-#[tokio::test]
-#[serial_test::serial(env_var_write_read)]
-async fn private_batch_and_read_token_retry_with_credentials() {
-    let _token = xet_runtime::utils::EnvVarGuard::set("HF_TOKEN", "test-credential");
-    let anonymous = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let authorized = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let check = {
-        let anonymous = anonymous.clone();
-        let authorized = authorized.clone();
-        move |headers: &HeaderMap| {
-            let ok = headers.get("authorization").and_then(|v| v.to_str().ok()) == Some("Bearer test-credential");
-            if ok { &authorized } else { &anonymous }.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            ok
-        }
-    };
-    let batch_check = check.clone();
-    let app = Router::new()
-        .route(
-            "/user/repo.git/info/lfs/objects/batch",
-            post(move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
-                let ok = batch_check(&headers);
-                async move {
-                    (
-                        if ok { StatusCode::OK } else { StatusCode::UNAUTHORIZED },
-                        Json(json!({ "objects": body["objects"] })),
-                    )
-                }
-            }),
-        )
-        .route(
-            "/api/models/user/repo/xet-read-token/main",
-            get(move |headers: HeaderMap| {
-                let ok = check(&headers);
-                async move {
-                    (
-                        if ok { StatusCode::OK } else { StatusCode::UNAUTHORIZED },
-                        Json(json!({
-                            "casUrl": "http://127.0.0.1", "accessToken": "test-cas-token", "exp": 4102444800u64,
-                        })),
-                    )
-                }
-            }),
-        );
-    let (endpoint, server) = serve(app).await;
-    for batch_first in [true, false] {
-        let (_dir, repo) = repository();
-        let mut client = LfsClient::new(
-            &XetContext::default().unwrap(),
-            repo,
-            format!("{endpoint}/user/repo.git").parse().unwrap(),
-            None,
-        )
-        .unwrap();
-        if batch_first {
-            assert!(client.batch(&request(), Operation::Upload).await.unwrap().is_none());
-        }
-        assert_eq!(client.read_token().await.unwrap().1.access_token, "test-cas-token");
-    }
-    assert_eq!(anonymous.load(std::sync::atomic::Ordering::SeqCst), 2);
-    assert_eq!(authorized.load(std::sync::atomic::Ordering::SeqCst), 3);
-    server.abort();
-}
-
-#[cfg(feature = "simulation")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial(env_var_write_read)]
 async fn native_upload_download_roundtrip_with_token_refresh() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::extract::{Request, State};
+    use axum::middleware::{Next, from_fn};
+    use axum::response::IntoResponse;
     use xet_client::cas_client::LocalTestServerBuilder;
     use xet_pkg::legacy::data_client;
 
+    let _token = xet_runtime::utils::EnvVarGuard::set("HF_TOKEN", "test-credential");
+    let anonymous = Arc::new(AtomicUsize::new(0));
+    let authorized = Arc::new(AtomicUsize::new(0));
+    let authenticate = from_fn({
+        let (anonymous, authorized) = (anonymous.clone(), authorized.clone());
+        move |request: Request, next: Next| {
+            let ok =
+                request.headers().get("authorization").and_then(|v| v.to_str().ok()) == Some("Bearer test-credential");
+            let n = if ok { &authorized } else { &anonymous }.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if !ok {
+                    StatusCode::UNAUTHORIZED.into_response()
+                } else if n == 0 {
+                    StatusCode::SERVICE_UNAVAILABLE.into_response() // Metadata requests retry transient failures.
+                } else {
+                    next.run(request).await
+                }
+            }
+        }
+    });
     let ctx = XetContext::default().unwrap();
     let cas = LocalTestServerBuilder::new().start().await;
     let endpoint = cas.http_endpoint().to_string();
@@ -202,13 +154,13 @@ async fn native_upload_download_roundtrip_with_token_refresh() {
         .await
         .unwrap()
         .remove(0);
-    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let requests = Arc::new(AtomicUsize::new(0));
     let app = Router::new().route("/api/models/user/repo/xet-read-token/main", get({
         let endpoint = endpoint.clone();
         let requests = requests.clone();
         move || { let endpoint = endpoint.clone(); let requests = requests.clone(); async move {
             // Force refresh after the initial metadata response.
-            let n = requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let n = requests.fetch_add(1, Ordering::SeqCst);
             Json(json!({ "casUrl": endpoint, "accessToken": "test", "exp": if n == 0 { 0 } else { 4102444800u64 } }))
         }}
     })).route("/user/repo.git/info/lfs/objects/batch", post(|State((hash, cas)): State<(String, String)>, Json(body): Json<serde_json::Value>| async move {
@@ -223,7 +175,7 @@ async fn native_upload_download_roundtrip_with_token_refresh() {
             "basic"
         };
         Json(json!({ "transfer": transfer, "objects": [object] }))
-    })).with_state((info.hash, endpoint));
+    })).with_state((info.hash, endpoint)).layer(authenticate);
     let (hub, server) = serve(app).await;
     let mut agent = XetAgent::new(Some(format!("{hub}/user/repo.git/info/lfs")));
     let init = InitRequestInner {
@@ -247,9 +199,15 @@ async fn native_upload_download_roundtrip_with_token_refresh() {
         .await
         .unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), CONTENT);
-    assert!(requests.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+    assert!(requests.load(Ordering::SeqCst) >= 2);
     assert!(!output.lock().unwrap().is_empty());
     drop(agent);
     assert!(!path.exists());
+    // Direct token requests also challenge and retry, then reuse the cached token.
+    let (_dir, mut client) = client(&hub);
+    assert_eq!(client.read_token().await.unwrap().1.access_token, "test");
+    assert_eq!(client.read_token().await.unwrap().1.access_token, "test");
+    assert_eq!(anonymous.load(Ordering::SeqCst), 3);
+    assert_eq!(authorized.load(Ordering::SeqCst), 6);
     server.abort();
 }
