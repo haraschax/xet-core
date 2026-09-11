@@ -1,153 +1,36 @@
 #!/bin/sh
+set -eu
 
-# This script detects the OS and architecture to download the correct binary,
-# unzips it, and moves it to the user's local bin directory.
-
-# --- Configuration ---
-XET_LINUX_AMD64="https://github.com/huggingface/xet-core/releases/download/git-xet-v0.2.1/git-xet-linux-x86_64.zip"
-XET_LINUX_ARM64="https://github.com/huggingface/xet-core/releases/download/git-xet-v0.2.1/git-xet-linux-aarch64.zip"
-XET_MACOS_AMD64="https://github.com/huggingface/xet-core/releases/download/git-xet-v0.2.1/git-xet-macos-x86_64.zip"
-XET_MACOS_ARM64="https://github.com/huggingface/xet-core/releases/download/git-xet-v0.2.1/git-xet-macos-aarch64.zip"
-
-LFS_LINUX_AMD64="https://github.com/git-lfs/git-lfs/releases/download/v3.7.1/git-lfs-linux-amd64-v3.7.1.tar.gz"
-LFS_LINUX_ARM64="https://github.com/git-lfs/git-lfs/releases/download/v3.7.1/git-lfs-linux-arm64-v3.7.1.tar.gz"
-LFS_MACOS_AMD64="https://github.com/git-lfs/git-lfs/releases/download/v3.7.1/git-lfs-darwin-amd64-v3.7.1.zip"
-LFS_MACOS_ARM64="https://github.com/git-lfs/git-lfs/releases/download/v3.7.1/git-lfs-darwin-arm64-v3.7.1.zip"
-
-BINARY_NAME="git-xet"
-INSTALL_DIR="/usr/local/bin"
-
-LFS_DIR="git-lfs-3.7.1"
-
-# --- Functions ---
-
-handle_error() {
-    echo "Error: $1" >&2
-    exit 1
-}
-
-# Cleanup function for temp dir
-cleanup() {
-    echo "Cleaning up..."
-    rm -rf "$TMP_DIR"
-}
-trap cleanup EXIT
-
-# --- Check required commands ---
-for cmd in uname curl unzip; do
-    if ! command -v "$cmd" >/dev/null 2>&1; then
-        handle_error "Required command '$cmd' is not installed. Please install it and rerun this script."
-    fi
-done
-
-# Detect OS and architecture
-OS="$(uname -s)"
-ARCH="$(uname -m)"
-
-echo "Detected OS: $OS"
-echo "Detected Architecture: $ARCH"
-
-XET_URL=""
-LFS_URL=""
-
-# Select download URL
-case "$OS" in
-    Linux)
-        case "$ARCH" in
-            x86_64)
-                XET_URL="$XET_LINUX_AMD64"
-                LFS_URL="$LFS_LINUX_AMD64"
-                ;;
-            aarch64|arm64)
-                XET_URL="$XET_LINUX_ARM64"
-                LFS_URL="$LFS_LINUX_ARM64"
-                ;;
-        esac
-        ;;
-    Darwin)
-        case "$ARCH" in
-            x86_64)
-                XET_URL="$XET_MACOS_AMD64"
-                LFS_URL="$LFS_MACOS_AMD64"
-                ;;
-            arm64)
-                XET_URL="$XET_MACOS_ARM64"
-                LFS_URL="$LFS_MACOS_ARM64"
-                ;;
-        esac
-        ;;
+RELEASE="${GIT_XET_RELEASE:-git-xet-v0.2.2-dev.1}"
+INSTALL_DIR="${GIT_XET_INSTALL_DIR:-${XDG_BIN_HOME:-$HOME/.local/bin}}"
+case "$INSTALL_DIR" in /*) ;; *) INSTALL_DIR="$PWD/$INSTALL_DIR" ;; esac
+case "$(uname -s)" in
+    Linux) OS=linux ;;
+    Darwin) OS=macos ;;
+    *) echo "Use the Windows wheel or release binary." >&2; exit 1 ;;
+esac
+case "$(uname -m)" in
+    x86_64) ARCH=x86_64 ;;
+    aarch64|arm64) ARCH=aarch64 ;;
+    *) echo "Unsupported architecture." >&2; exit 1 ;;
 esac
 
-if [ -z "$XET_URL" ]; then
-    handle_error "Unsupported OS/Architecture combination: $OS/$ARCH"
-fi
-
-# Make temporary directory
+ARCHIVE="git-xet-$OS-$ARCH.tar.gz"
+BASE_URL="https://github.com/haraschax/xet-core/releases/download/$RELEASE"
 TMP_DIR="$(mktemp -d)"
-[ -z "$TMP_DIR" ] && handle_error "Failed to create temporary directory."
-
-cd "$TMP_DIR" || handle_error "Could not cd into temp directory."
-
-echo "Downloading from: $XET_URL..."
-if ! curl -sSL -o binary.zip "$XET_URL"; then
-    handle_error "Download failed."
-fi
-
-echo "Unzipping..."
-if ! unzip -q binary.zip; then
-    handle_error "Unzipping failed. Install 'unzip' and try again."
-fi
-
-if [ ! -f "$BINARY_NAME" ]; then
-    handle_error "Binary '$BINARY_NAME' not found in the archive."
-fi
-
-echo "Setting executable permissions..."
-chmod +x "$BINARY_NAME"
-
-echo "Installing to $INSTALL_DIR..."
-if [ -w "$INSTALL_DIR" ]; then
-    mv "$BINARY_NAME" "$INSTALL_DIR/" || handle_error "Failed to move binary."
+trap 'rm -rf "$TMP_DIR"' EXIT HUP INT TERM
+curl -fSL "$BASE_URL/$ARCHIVE" -o "$TMP_DIR/$ARCHIVE"
+curl -fsSL "$BASE_URL/SHA256SUMS" -o "$TMP_DIR/SHA256SUMS"
+cd "$TMP_DIR"
+awk -v archive="$ARCHIVE" '$2 == archive { print; found=1 } END { if (!found) exit 1 }' SHA256SUMS > check.sha256
+if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum -c check.sha256
 else
-    echo "Need sudo permissions to install to $INSTALL_DIR."
-    if ! sudo mv "$BINARY_NAME" "$INSTALL_DIR/"; then
-        handle_error "Failed to move binary with sudo."
-    fi
+    shasum -a 256 -c check.sha256
 fi
-
-# Check git-lfs
-if ! command -v git-lfs >/dev/null 2>&1; then
-    printf "The dependency git-lfs is not installed. Continue to install it from https://github.com/git-lfs/git-lfs/releases? (y/n) "
-    read -r response < /dev/tty
-    if [ "$response" = "y" ]; then
-        # Download and extract git-lfs based on OS
-        if [ "$OS" = "Linux" ]; then
-            echo "Downloading git-lfs from: $LFS_URL..."
-            if ! curl -sSL -o lfs.tar.gz "$LFS_URL"; then
-                handle_error "LFS download failed."
-            fi
-            echo "Extracting tarball..."
-            if ! tar -xzf lfs.tar.gz; then
-                handle_error "LFS extraction failed. Install 'tar' and try again."
-            fi
-        else # Darwin (macOS)
-            echo "Downloading git-lfs from: $LFS_URL..."
-            if ! curl -sSL -o lfs.zip "$LFS_URL"; then
-                handle_error "LFS download failed."
-            fi
-            echo "Unzipping..."
-            if ! unzip -q lfs.zip; then
-                handle_error "Unzipping LFS failed. Install 'unzip' and try again."
-            fi
-        fi
-        cd "$LFS_DIR" || handle_error "Could not cd into LFS directory '$LFS_DIR'."
-        sudo ./install.sh
-    else
-        echo "Please install git-lfs for git-xet to work. Install it from https://git-lfs.com/"
-    fi
-fi
-
-# Post-install
-git-xet install --concurrency 3
-
-echo "Installation complete!"
+tar -xzf "$ARCHIVE"
+mkdir -p "$INSTALL_DIR"
+install -m 755 git-xet "$INSTALL_DIR/git-xet"
+"$INSTALL_DIR/git-xet" --version
+echo "Installed to $INSTALL_DIR. Add it to PATH, then configure your repository:"
+echo 'git xet install --local --lfs-url https://huggingface.co/OWNER/REPO.git/info/lfs'

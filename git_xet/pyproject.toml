@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "git-xet"
+dynamic = ["version"]
+description = "Native Git LFS uploads and downloads using Xet"
+requires-python = ">=3.8"
+license = "Apache-2.0"
+
+[tool.maturin]
+bindings = "bin"
+strip = true

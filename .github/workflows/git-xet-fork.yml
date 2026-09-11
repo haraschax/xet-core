@@ -1,0 +1,61 @@
+name: git-xet fork
+
+on:
+  push:
+    branches: [git-xet-downloads]
+  pull_request:
+    paths: ["git_xet/**", "Cargo.lock", ".github/workflows/git-xet-fork.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+  CARGO_PROFILE_RELEASE_STRIP: symbols
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            platform: linux-x86_64
+          - runner: ubuntu-22.04-arm
+            platform: linux-aarch64
+          - runner: macos-15
+            platform: macos-aarch64
+          - runner: macos-15-intel
+            platform: macos-x86_64
+          - runner: windows-latest
+            platform: windows-x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: 1.95.0
+      - uses: ./.github/actions/cache-rust-build
+      - run: cargo test --locked -p git_xet --features simulation --lib
+      - run: cargo build --locked --release -p git_xet
+      - name: Package native binary and wheel
+        shell: bash
+        run: |
+          python -m pip install 'maturin>=1.9,<2'
+          mkdir -p dist
+          cd git_xet
+          maturin build --locked --release --out ../dist
+          cd ..
+          binary=git-xet
+          if [ "${{ runner.os }}" = Windows ]; then binary=git-xet.exe; fi
+          cp "target/release/$binary" dist/
+          cp LICENSE dist/
+          tar -czf "git-xet-${{ matrix.platform }}.tar.gz" -C dist "$binary" LICENSE
+          mv "git-xet-${{ matrix.platform }}.tar.gz" dist/
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: git-xet-${{ matrix.platform }}
+          path: |
+            dist/*.tar.gz
+            dist/*.whl

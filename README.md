@@ -25,6 +25,8 @@ limitations under the License.
 
 ## Welcome
 
+**Fork:** native Git LFS downloads and standalone uploads are implemented on the `git-xet-downloads` branch. See [Git-Xet installation and usage](git_xet/README.md#this-fork).
+
 xet-core enables huggingface_hub to utilize xet storage for uploading and downloading to HF Hub. Xet storage provides chunk-based deduplication, efficient storage/retrieval with local disk caching, and backwards compatibility with Git LFS. This library is not meant to be used directly, and is instead intended to be used from [huggingface_hub](https://pypi.org/project/huggingface-hub).
 
 ## Key features
