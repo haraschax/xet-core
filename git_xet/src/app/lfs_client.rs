@@ -1,5 +1,8 @@
 //! LFS negotiation for standalone transfers and native Xet downloads.
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::io::{Read, Write};
+#[cfg(windows)]
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::path::Path;
