@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-RELEASE="${GIT_XET_RELEASE:-git-xet-v0.2.2-dev.1}"
+RELEASE="${GIT_XET_RELEASE:-git-xet-v0.2.2-dev.2}"
 INSTALL_DIR="${GIT_XET_INSTALL_DIR:-${XDG_BIN_HOME:-$HOME/.local/bin}}"
 case "$INSTALL_DIR" in /*) ;; *) INSTALL_DIR="$PWD/$INSTALL_DIR" ;; esac
 case "$(uname -s)" in
