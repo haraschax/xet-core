@@ -1,7 +1,6 @@
 //! LFS negotiation for standalone transfers and native Xet downloads.
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::os::unix::fs::FileExt;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::path::Path;
 use std::sync::Arc;
@@ -243,6 +242,18 @@ impl LfsClient {
     }
 }
 
+#[cfg(unix)]
+fn write_range_at(file: &mut std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.write_all_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn write_range_at(file: &mut std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(buf)
+}
+
 async fn parallel_ranged_download<W: Write + Send + Sync + 'static>(
     client: &ClientWithMiddleware,
     action: &GitBatchApiResponseAction,
@@ -299,14 +310,14 @@ async fn parallel_ranged_download<W: Write + Send + Sync + 'static>(
                 let bytes_since_report = total.fetch_add(chunk.len() as u64, Ordering::Relaxed);
                 block.extend_from_slice(&chunk);
                 if block.len() >= 8 * 1024 * 1024 {
-                    file.write_all_at(&block, offset)?;  // use std::os::unix::fs::FileExt via import
+                    write_range_at(&mut file, &block, offset)?;
                     offset += block.len() as u64;
                     block.clear();
                     progress.update_bytes_so_far(bytes_since_report + chunk.len() as u64)?;
                 }
             }
             if !block.is_empty() {
-                file.write_all_at(&block, offset).map_err(GitXetError::internal)?;
+                write_range_at(&mut file, &block, offset).map_err(GitXetError::internal)?;
                 file.sync_all().ok();
             }
             Ok::<Option<String>, GitXetError>(None)
