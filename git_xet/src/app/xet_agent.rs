@@ -150,7 +150,7 @@ impl TransferAgent for XetAgent {
         progress_updater.update_bytes_so_far(1)?;
 
         let xet_updater = Arc::new(XetProgressUpdaterWrapper {
-            updater: progress_updater,
+            updater: Arc::new(progress_updater),
         });
 
         let cas_url = req
@@ -237,7 +237,7 @@ impl TransferAgent for XetAgent {
 }
 
 pub(super) struct XetProgressUpdaterWrapper<W: Write + Send + Sync + 'static> {
-    pub(super) updater: ProgressUpdater<W>,
+    pub(super) updater: Arc<ProgressUpdater<W>>,
 }
 
 #[async_trait]

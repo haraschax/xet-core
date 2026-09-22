@@ -1,6 +1,8 @@
 //! LFS negotiation for standalone transfers and native Xet downloads.
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::os::unix::fs::FileExt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -24,6 +26,14 @@ use crate::errors::{GitXetError, Result};
 use crate::git_repo::GitRepo;
 use crate::git_url::{GitUrl, Scheme};
 use crate::lfs_agent_protocol::{GitBatchApiResponseAction, ProgressUpdater, TransferRequest};
+
+// Large objects use parallel ranged GETs against the download URL. The reconstruct pipeline
+// is throughput-bound by per-stream CAS chunk processing, while the Hub's CDN serves far more
+// bandwidth than a single connection saturates; the warm-shard-cache dedup benefit only applies
+// to small objects and repeat pulls either way.
+const PARALLEL_HTTP_MIN_SIZE: u64 = 64 * 1024 * 1024;
+const PARALLEL_HTTP_MAX_RANGES: u64 = 8;
+const PARALLEL_HTTP_MIN_RANGE: u64 = 16 * 1024 * 1024;
 
 pub(super) fn remote_from_lfs_url(url: &str) -> Result<GitUrl> {
     let remote: GitUrl = url
@@ -175,23 +185,37 @@ impl LfsClient {
             req.action.clone()
         };
 
+        let progress = Arc::new(progress);
+        let mut ranged_used = false;
+        if req.size >= PARALLEL_HTTP_MIN_SIZE && !action.href.is_empty() {
+            tracing::info!(oid = %req.oid, "Downloading large LFS object with parallel ranged requests");
+            match parallel_ranged_download(&self.client, &action, path, req.size, progress.clone()).await? {
+                Some(unsupported) => {
+                    tracing::info!(oid = %req.oid, "parallel ranged download unsupported: {unsupported}")
+                },
+                None => ranged_used = true,
+            }
+        }
+        if ranged_used {
+            return verify_download(path, &req.oid, req.size);
+        }
         if let Some(hash) = bridge_hash(&action.href) {
             tracing::info!(oid = %req.oid, "Downloading LFS object using native Xet");
             let (refresher, token) = self.read_token().await?;
             let (refresher, endpoint, token_info) =
                 (refresher.clone(), token.cas_url.clone(), (token.access_token.clone(), token.exp));
-            let progress = Arc::new(XetProgressUpdaterWrapper { updater: progress });
-            download_async(
-                &self.ctx,
-                vec![(XetFileInfo::new(hash, req.size), path.to_string_lossy().into_owned())],
-                Some(endpoint),
-                Some(token_info),
-                Some(refresher),
-                Some(vec![progress]),
-                None,
-            )
-            .await
-            .map_err(|_| GitXetError::internal("Xet download failed; use --verbose --log for details"))?;
+            let progress = Arc::new(XetProgressUpdaterWrapper { updater: progress.clone() });
+                download_async(
+                    &self.ctx,
+                    vec![(XetFileInfo::new(hash, req.size), path.to_string_lossy().into_owned())],
+                    Some(endpoint),
+                    Some(token_info),
+                    Some(refresher),
+                    Some(vec![progress]),
+                    None,
+                )
+                .await
+                .map_err(|_| GitXetError::internal("Xet download failed; use --verbose --log for details"))?;
         } else {
             // Objects that have not been converted to Xet still have ordinary LFS download actions.
             let mut request = self.client.get(&action.href);
@@ -217,6 +241,90 @@ impl LfsClient {
         }
         verify_download(path, &req.oid, req.size)
     }
+}
+
+async fn parallel_ranged_download<W: Write + Send + Sync + 'static>(
+    client: &ClientWithMiddleware,
+    action: &GitBatchApiResponseAction,
+    path: &Path,
+    size: u64,
+    progress: Arc<ProgressUpdater<W>>,
+) -> Result<Option<String>> {
+    let streams = PARALLEL_HTTP_MAX_RANGES.min(size / PARALLEL_HTTP_MIN_RANGE).max(2);
+    let range_size = size.div_ceil(streams);
+    let total = Arc::new(AtomicU64::new(0));
+
+    let mut tasks = Vec::with_capacity(streams as usize);
+    for index in 0..streams {
+        let start = index * range_size;
+        let end = (start + range_size).min(size);
+        if start >= end {
+            break;
+        }
+        let mut request = client.get(&action.href);
+        for (name, value) in &action.header {
+            request = request.header(name, value);
+        }
+        request = request.header(http::header::RANGE, format!("bytes={start}-{}", end - 1));
+        let progress = progress.clone();
+        let total = total.clone();
+        let path = path.to_owned();
+        tasks.push(tokio::spawn(async move {
+            let mut response = request
+                .send()
+                .await
+                .map_err(|_| GitXetError::internal("ranged download request failed"))?;
+            if response.status() != StatusCode::PARTIAL_CONTENT {
+                return Ok(Some(format!(
+                    "status {} for ranged request (200 OK is not treated as full range support)",
+                    response.status()
+                )));
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .map_err(GitXetError::internal)?;
+            let mut offset = start;
+            let mut block = Vec::with_capacity(8 * 1024 * 1024);
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|error| GitXetError::internal(http_error(error)))?
+            {
+                if offset + chunk.len() as u64 > end {
+                    return Err(GitXetError::internal("ranged download exceeded its range"));
+                }
+                let bytes_since_report = total.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                block.extend_from_slice(&chunk);
+                if block.len() >= 8 * 1024 * 1024 {
+                    file.write_all_at(&block, offset)?;  // use std::os::unix::fs::FileExt via import
+                    offset += block.len() as u64;
+                    block.clear();
+                    progress.update_bytes_so_far(bytes_since_report + chunk.len() as u64)?;
+                }
+            }
+            if !block.is_empty() {
+                file.write_all_at(&block, offset).map_err(GitXetError::internal)?;
+                file.sync_all().ok();
+            }
+            Ok::<Option<String>, GitXetError>(None)
+        }));
+    }
+
+    let mut unsupported = None;
+    for task in tasks {
+        match task.await.map_err(|error| GitXetError::internal(format!("ranged task failed: {error}")))? {
+            Ok(None) => {},
+            Ok(Some(message)) => unsupported = Some(match unsupported {
+                Some(old) => format!("{old}; {message}"),
+                None => message,
+            }),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(unsupported)
 }
 
 // The LFS bridge URL includes the Xet hash even for objects without a Hub commit.
